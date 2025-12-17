@@ -1,0 +1,416 @@
+name: Build ARK Plugin
+
+on:
+  workflow_dispatch:  # Дозволяє запускати вручну
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET Framework
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Create Project
+        run: |
+          mkdir Plugin && cd Plugin
+          dotnet new classlib --framework net48 --name StructurePvEProtection
+          dotnet add package MySqlConnector --version 2.3.5
+          dotnet add package Newtonsoft.Json --version 13.0.3
+
+      - name: Add Plugin Code
+        run: |
+          $code = @'
+          using System;
+          using System.IO;
+          using System.Threading.Tasks;
+          using ArkApi;
+          using ArkApi.Extensions;
+          using Newtonsoft.Json;
+          using UE4SSDotNet;
+          using MySqlConnector;
+          
+          namespace StructurePvEProtectionPlugin
+          {
+              public class StructurePvEProtection : Plugin
+              {
+                  $code = @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using ArkApi;
+using ArkApi.Extensions;
+using Newtonsoft.Json;
+using UE4SSDotNet;
+using MySqlConnector;
+
+namespace StructurePvEProtectionPlugin
+{
+    public class StructurePvEProtection : Plugin
+    {
+        private static PluginConfig Config => _config ??= LoadConfig();
+        private static PluginConfig _config;
+        private static MySqlConnection _connection;
+
+        private static readonly string PluginDir = Path.Combine(Api.GetApiDirectory(), "Plugins", "StructurePvEProtection");
+        private static readonly string ConfigFile = Path.Combine(PluginDir, "config.json");
+
+        public override string Name => "StructurePvEProtection";
+        public override string Author => "You";
+        public override string Version => "2.1";
+        public override string Description => "Full PvE/PvP clan isolation + MySQL + HUD warnings.";
+
+        private class PluginConfig
+        {
+            [JsonProperty("ProtectionDurationDays")]
+            public double ProtectionDurationDays { get; set; } = 7.0;
+
+            [JsonProperty("MaxLevelForProtection")]
+            public int MaxLevelForProtection { get; set; } = 100;
+
+            [JsonProperty("CommandName")]
+            public string CommandName { get; set; } = "pveinfo";
+
+            [JsonProperty("Messages")]
+            public MessagesConfig Messages { get; set; } = new MessagesConfig();
+
+            [JsonProperty("Database")]
+            public DbConfig Database { get; set; } = new DbConfig();
+        }
+
+        private class MessagesConfig
+        {
+            [JsonProperty("PvETryingToAddPvP")]
+            public string PvETryingToAddPvP { get; set; } = "🚫 Ви (PvE) не можете додавати PvP-гравців у свій клан.";
+            [JsonProperty("PvPTryingToAddPvE")]
+            public string PvPTryingToAddPvE { get; set; } = "🚫 Ви (PvP) не можете додавати PvE-гравців у свій клан.";
+            [JsonProperty("PvEJoiningPvPTribe")]
+            public string PvEJoiningPvPTribe { get; set; } = "🚫 Вам (PvE) заборонено входити в PvP-клани. Вас вилучено з клану.";
+            [JsonProperty("PvPJoiningPvETribe")]
+            public string PvPJoiningPvETribe { get; set; } = "🚫 Вам (PvP) заборонено входити в PvE-клани. Вас вилучено з клану.";
+            [JsonProperty("PvEInfoMessage")]
+            public string PvEInfoMessage { get; set; } = "ℹ️ Ваші структури захищені, але ви — ні.";
+        }
+
+        private class DbConfig
+        {
+            public string Host { get; set; } = "localhost";
+            public int Port { get; set; } = 3306;
+            public string Database { get; set; } = "ark_server";
+            public string Username { get; set; } = "ark_user";
+            public string Password { get; set; } = "";
+            public string TableName { get; set; } = "pve_protection_players";
+            public bool UseSsl { get; set; } = false;
+            public int ConnectionTimeout { get; set; } = 10;
+            public int CommandTimeout { get; set; } = 30;
+        }
+
+        private class PlayerData
+        {
+            public string SteamId { get; set; }
+            public DateTime FirstLoginUtc { get; set; }
+            public int Level { get; set; } = 1;
+        }
+
+        public override void Load()
+        {
+            EnsureDirectories();
+            _config = LoadConfig();
+            if (!InitializeDatabase()) return;
+            Hooks.PlayerLoginEvent.Add(OnPlayerLogin);
+            Hooks.TakeDamage.Add(OnTakeDamage);
+            Hooks.ServerCommandEvent.Add(OnServerCommand);
+            Log($"✅ {Name} v{Version} завантажено.");
+        }
+
+        public override void Unload()
+        {
+            Hooks.PlayerLoginEvent.Remove(OnPlayerLogin);
+            Hooks.TakeDamage.Remove(OnTakeDamage);
+            Hooks.ServerCommandEvent.Remove(OnServerCommand);
+            _connection?.Dispose();
+        }
+
+        private static void EnsureDirectories() => Directory.CreateDirectory(PluginDir);
+
+        private static PluginConfig LoadConfig()
+        {
+            try
+            {
+                if (!File.Exists(ConfigFile))
+                {
+                    var cfg = new PluginConfig();
+                    File.WriteAllText(ConfigFile, JsonConvert.SerializeObject(cfg, Formatting.Indented));
+                    return cfg;
+                }
+                return JsonConvert.DeserializeObject<PluginConfig>(File.ReadAllText(ConfigFile)) ?? new PluginConfig();
+            }
+            catch { return new PluginConfig(); }
+        }
+
+        private bool InitializeDatabase()
+        {
+            try
+            {
+                var db = Config.Database;
+                var csb = new MySqlConnectionStringBuilder
+                {
+                    Server = db.Host, Port = (uint)db.Port, Database = db.Database,
+                    UserID = db.Username, Password = db.Password,
+                    SslMode = db.UseSsl ? MySqlSslMode.Preferred : MySqlSslMode.None,
+                    ConnectionTimeout = (uint)db.ConnectionTimeout,
+                    DefaultCommandTimeout = (uint)db.CommandTimeout
+                };
+                _connection = new MySqlConnection(csb.ConnectionString);
+                _connection.Open();
+                CreateTables().Wait();
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private async Task CreateTables()
+        {
+            var t = Config.Database.TableName;
+            await new MySqlCommand($@"
+                CREATE TABLE IF NOT EXISTS `{t}` (
+                    `steam_id` VARCHAR(20) NOT NULL PRIMARY KEY,
+                    `first_login_utc` DATETIME(6) NOT NULL,
+                    `level` INT NOT NULL DEFAULT 1,
+                    `last_update_utc` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+                );", _connection).ExecuteNonQueryAsync();
+        }
+
+        private async Task<PlayerData> GetPlayerDataAsync(string sid)
+        {
+            try
+            {
+                using var cmd = new MySqlCommand($"SELECT * FROM `{Config.Database.TableName}` WHERE steam_id=@sid", _connection);
+                cmd.Parameters.AddWithValue("@sid", sid);
+                using var r = await cmd.ExecuteReaderAsync();
+                if (await r.ReadAsync()) return new PlayerData
+                {
+                    SteamId = r.GetString("steam_id"),
+                    FirstLoginUtc = r.GetDateTime("first_login_utc"),
+                    Level = r.GetInt32("level")
+                };
+            }
+            catch { }
+            return null;
+        }
+
+        private async Task UpsertPlayer(string sid, int lvl)
+        {
+            try
+            {
+                var t = Config.Database.TableName;
+                await new MySqlCommand($@"
+                    INSERT INTO `{t}` (steam_id, first_login_utc, level)
+                    VALUES (@sid, @now, @lvl)
+                    ON DUPLICATE KEY UPDATE level=@lvl;", _connection)
+                    .AddParameter("@sid", sid)
+                    .AddParameter("@now", DateTime.UtcNow)
+                    .AddParameter("@lvl", lvl)
+                    .ExecuteNonQueryAsync();
+            }
+            catch { }
+        }
+
+        private void OnPlayerLogin(AShooterPlayerController pc)
+        {
+            if (pc == null) return;
+            var sid = pc.GetSteamId().ToString();
+            var lvl = pc?.PlayerStateField()?.LevelField() ?? 1;
+
+            _ = Task.Run(async () =>
+            {
+                await UpsertPlayer(sid, lvl);
+                var me = await GetPlayerDataAsync(sid);
+                if (me == null) return;
+                await Task.Delay(3000);
+                Api.InvokeInGameThread(() =>
+                {
+                    if (!pc.IsConnected()) return;
+                    var tribe = pc.GetTribe();
+                    if (tribe == null) return;
+                    bool imPvE = IsPvE(me);
+                    bool conflict = false;
+                    foreach (var m in tribe.MembersField())
+                    {
+                        if (m == null) continue;
+                        var msid = m.SteamIdField().ToString();
+                        if (msid == sid) continue;
+                        var md = await GetPlayerDataAsync(msid);
+                        if (md != null && IsPvE(md) != imPvE) { conflict = true; break; }
+                    }
+                    if (conflict)
+                    {
+                        tribe.RemoveMember(pc);
+                        pc.ClientMessage(imPvE ? Config.Messages.PvEJoiningPvPTribe : Config.Messages.PvPJoiningPvETribe, 6f, 1f, Color.Red);
+                    }
+                    if (imPvE) pc.ClientMessage(Config.Messages.PvEInfoMessage, 4f, 1f, Color.Yellow);
+                });
+            });
+        }
+
+        private void OnTakeDamage(AActor v, AShooterCharacter a, float d, DamageEvent e)
+        {
+            if (a == null || !a.IsPlayer()) return;
+            var osid = GetOwnerSteamId(v);
+            if (string.IsNullOrEmpty(osid)) return;
+            _ = Task.Run(async () =>
+            {
+                var od = await GetPlayerDataAsync(osid);
+                if (od != null && IsPvE(od))
+                {
+                    Api.InvokeInGameThread(() =>
+                    {
+                        if (e.IsValid()) e.Damage = 0f;
+                    });
+                }
+            });
+        }
+
+        private void OnServerCommand(AShooterPlayerController pc, ref string cmd, ref bool cancel)
+        {
+            if (pc == null) return;
+            var args = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (args.Length == 0) return;
+            var c = args[0].ToLowerInvariant();
+            var exp = (Config.CommandName ?? "pveinfo").TrimStart('/').ToLowerInvariant();
+
+            if (c == exp)
+            {
+                var sid = pc.GetSteamId().ToString();
+                _ = Task.Run(async () =>
+                {
+                    var d = await GetPlayerDataAsync(sid);
+                    var info = FormatInfo(pc.GetPlayerName() ?? "Player", sid, d);
+                    Api.InvokeInGameThread(() => pc.SendChatMessage(info, 1));
+                });
+                cancel = true;
+                return;
+            }
+
+            if (new[] { "invite", "addmember", "ally", "jointribe", "accepttribeinvite" }.Contains(c))
+            {
+                string tsid = null;
+                if (c == "jointribe" || c == "accepttribeinvite")
+                    tsid = ResolveTribeOwner(args.Length > 1 ? args[1] : null);
+                else
+                    tsid = ResolvePlayer(args.Length > 1 ? args[1] : null);
+
+                if (string.IsNullOrEmpty(tsid)) return;
+
+                _ = Task.Run(async () =>
+                {
+                    var isid = pc.GetSteamId().ToString();
+                    var id = await GetPlayerDataAsync(isid);
+                    var td = await GetPlayerDataAsync(tsid);
+                    if (id == null || td == null) return;
+                    if (IsPvE(id) != IsPvE(td))
+                    {
+                        string m = IsPvE(id) ? Config.Messages.PvETryingToAddPvP : Config.Messages.PvPTryingToAddPvE;
+                        Api.InvokeInGameThread(() =>
+                        {
+                            pc.ClientMessage(m, 5f, 1f, Color.Red);
+                            cancel = true;
+                        });
+                    }
+                });
+            }
+        }
+
+        private bool IsPvE(PlayerData d) => d.Level < Config.MaxLevelForProtection && (DateTime.UtcNow - d.FirstLoginUtc).TotalDays < Config.ProtectionDurationDays;
+
+        private string FormatInfo(string n, string sid, PlayerData d)
+        {
+            if (d == null) return $"ℹ️ {n}, дані ще не завантажені.";
+            bool p = IsPvE(d);
+            return $@"ℹ️ {n}, ваш статус:
+• Рівень: {d.Level}
+• Днів на сервері: {(DateTime.UtcNow - d.FirstLoginUtc).TotalDays:F1}
+• Статус: {(p ? "🛡️ PvE (захищено)" : "⚔️ PvP (вразливо)")}
+• Захист структур: {(p ? "✅ Так" : "❌ Ні")}";
+        }
+
+        private string ResolvePlayer(string i)
+        {
+            if (ulong.TryParse(i, out _)) return i;
+            foreach (var p in Api.GetPlayersList())
+                if (p.Name.Equals(i, StringComparison.OrdinalIgnoreCase))
+                    return p.SteamId.ToString();
+            return null;
+        }
+
+        private string ResolveTribeOwner(string i)
+        {
+            try
+            {
+                if (long.TryParse(i, out long id))
+                {
+                    foreach (var t in Api.GetAllTribes())
+                        if (t.TribeIDField() == id && t.MembersField().Length > 0)
+                            return t.MembersField()[0].SteamIdField().ToString();
+                }
+                foreach (var p in Api.GetPlayersList())
+                {
+                    var t = p.PlayerController?.GetTribe();
+                    if (t != null && t.TribeNameField().Equals(i, StringComparison.OrdinalIgnoreCase))
+                        return p.SteamId.ToString();
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private string GetOwnerSteamId(AActor a)
+        {
+            if (a == null) return null;
+            var pc = a.GetOwnerPlayerController();
+            if (pc != null) return pc.GetSteamId().ToString();
+            var p = a.GetOwnerPlayer();
+            if (p != null) return p.GetSteamId().ToString();
+            var tid = a.GetTeamId();
+            if (tid > 0)
+            {
+                var m = Api.GetPlayersList().Find(x => x.GetTeamId() == tid);
+                if (m?.PlayerController != null)
+                    return m.PlayerController.GetSteamId().ToString();
+            }
+            return null;
+        }
+    }
+
+    public static class Color { public static readonly float[] Red = { 1.0f, 0.2f, 0.2f }; public static readonly float[] Yellow = { 1.0f, 0.9f, 0.3f }; }
+
+    [PluginEntry]
+    public static void Main() => Api.RegisterPlugin<StructurePvEProtection>();
+}
+'@
+Set-Content -Path "Plugin/StructurePvEProtection/StructurePvEProtection.cs" -Value $code
+              }
+              
+              public static class Color { public static readonly float[] Red = {1f,0.2f,0.2f}; }
+              
+              [PluginEntry] public static void Main() => Api.RegisterPlugin<StructurePvEProtection>();
+          }
+          '@
+          Set-Content -Path "Plugin/StructurePvEProtection/StructurePvEProtection.cs" -Value $code
+
+      - name: Build
+        run: |
+          cd Plugin
+          dotnet build -c Release -r win-x64 --no-restore
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ark-plugin
+          path: |
+            Plugin/StructurePvEProtection/bin/Release/net48/win-x64/StructurePvEProtection.dll
+            Plugin/StructurePvEProtection/bin/Release/net48/win-x64/MySqlConnector.dll
